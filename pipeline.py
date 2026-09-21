@@ -50,7 +50,7 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY"),
 )
 
-MODELO_AGENTE = os.getenv("AGENTE_MODELO", "anthropic/claude-sonnet-4-6")
+MODELO_AGENTE = os.getenv("AGENTE_MODELO", "opencode-go/deepseek-v4-flash")
 MODELO_SIMPLE = "gpt-4o-mini"
 CANTIDAD_CHUNKS_RAG = 3
 

@@ -4,23 +4,27 @@ Servidor local del agente — El Detective de Bugs
 
 Corre en tu máquina (la misma donde está el repo víctima y OpenCode
 instalado). n8n, aunque esté en Railway (la nube), le pega a este
-servidor a través de un túnel de ngrok — así el agente sí tiene acceso
-real a los archivos del repo para diagnosticar y aplicar fixes.
+servidor a través de un Cloudflare Tunnel — así el agente sí tiene
+acceso real a los archivos del repo para diagnosticar y aplicar fixes.
 
 Uso:
     python agent_server.py
-    (en otra terminal) ngrok http 5000
+    (en otra terminal) cloudflared tunnel run detective
+        — o, sin dominio propio: cloudflared tunnel --url http://localhost:5000
 
-Copiá la URL https que te da ngrok (algo como
-https://abcd-1234.ngrok-free.app) y usala en el nodo HTTP Request de
-n8n que reemplaza a todo el bloque de RAG + agente + guardado.
+Usá la URL https del túnel en el nodo HTTP Request de n8n que reemplaza
+a todo el bloque de RAG + agente + guardado. Ver README, sección
+"Exponer el servidor con Cloudflare Tunnel".
+
+Seguridad: el túnel es público. Toda request a /procesar tiene que traer
+el header X-Agent-Token igual a AGENT_TOKEN del .env, si no devuelve 401.
 """
 
 import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -34,9 +38,14 @@ app = Flask(__name__)
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-MODELO_AGENTE = os.getenv("AGENTE_MODELO", "anthropic/claude-sonnet-4-6")
+MODELO_AGENTE = os.getenv("AGENTE_MODELO", "opencode-go/deepseek-v4-flash")
 MODELO_SIMPLE = "gpt-4o-mini"
 CANTIDAD_CHUNKS_RAG = 3
+AGENT_TOKEN = os.getenv("AGENT_TOKEN")
+TIMEOUT_AGENTE_SEG = 240  # n8n espera 420 s en total; el resto es git + RAG + gpt-4o-mini
+# Si ya hay un incidente para el mismo endpoint más nuevo que esto, no se
+# vuelve a llamar al agente (el monitor de anomalías repite cada 5 min).
+VENTANA_DEDUP_HORAS = int(os.getenv("VENTANA_DEDUP_HORAS", "2"))
 
 
 def get_embedding(texto: str):
@@ -131,16 +140,36 @@ def llamar_agente(prompt_final: str, repo_path: str) -> dict:
     git de repo-victima, no el deploy de Render), así que puede leer el
     código y aplicar el fix directamente.
     """
-    resultado = subprocess.run(
-        ["opencode", "run", "--agent", "detective-de-bugs", "--model", MODELO_AGENTE, "--format", "json", prompt_final],
-        capture_output=True,
-        text=True,
-        timeout=300,
-        cwd=repo_path,
-    )
+    try:
+        resultado = subprocess.run(
+            ["opencode", "run", "--agent", "detective-de-bugs", "--model", MODELO_AGENTE, "--format", "json", prompt_final],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_AGENTE_SEG,
+            cwd=repo_path,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"El agente no terminó en {TIMEOUT_AGENTE_SEG} s; se abortó sin commitear.")
     if resultado.returncode != 0:
         raise RuntimeError(f"El agente falló: {resultado.stderr}")
     return json.loads(resultado.stdout)
+
+
+def incidente_reciente(endpoint: str):
+    """Devuelve el incidente más nuevo del mismo endpoint dentro de la ventana, o None."""
+    if not endpoint:
+        return None
+    desde = (datetime.now(timezone.utc) - timedelta(hours=VENTANA_DEDUP_HORAS)).isoformat()
+    r = (
+        supabase.table("incidentes")
+        .select("metadata")
+        .eq("metadata->>endpoint", endpoint)
+        .gte("metadata->>timestamp", desde)
+        .order("metadata->>timestamp", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return r.data[0]["metadata"] if r.data else None
 
 
 def guardar_solucion(payload: dict, resultado_agente: dict):
@@ -174,6 +203,11 @@ def guardar_solucion(payload: dict, resultado_agente: dict):
 
 @app.route("/procesar", methods=["POST"])
 def procesar():
+    if not AGENT_TOKEN:
+        return jsonify({"error": "AGENT_TOKEN no está definido en el .env del agente"}), 500
+    if request.headers.get("X-Agent-Token") != AGENT_TOKEN:
+        return jsonify({"error": "token inválido"}), 401
+
     payload = request.get_json()
     if not payload or "descripcion" not in payload:
         return jsonify({"error": "falta 'descripcion' en el body"}), 400
@@ -187,6 +221,13 @@ def procesar():
         }), 500
 
     try:
+        previo = incidente_reciente(payload.get("endpoint"))
+        if previo:
+            return jsonify({
+                "skip": f"ya hay un incidente para {payload.get('endpoint')} en las últimas {VENTANA_DEDUP_HORAS} h",
+                "incidente_previo": previo,
+            }), 200
+
         git_pull(repo_path)
         contexto_proyecto, incidentes_similares = consultar_rag(payload["descripcion"])
         prompt_final = armar_prompt_final(payload, contexto_proyecto, incidentes_similares, repo_path)
@@ -209,5 +250,5 @@ def salud():
 
 if __name__ == "__main__":
     print("Servidor del agente local corriendo en http://localhost:5000")
-    print("Exponelo con: ngrok http 5000")
+    print("Exponelo con: cloudflared tunnel run detective  (o: cloudflared tunnel --url http://localhost:5000)")
     app.run(host="0.0.0.0", port=5000)

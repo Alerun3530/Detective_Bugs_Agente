@@ -1,254 +1,848 @@
 """
 Servidor local del agente — El Detective de Bugs
-=================================================
 
-Corre en tu máquina (la misma donde está el repo víctima y OpenCode
-instalado). n8n, aunque esté en Railway (la nube), le pega a este
-servidor a través de un Cloudflare Tunnel — así el agente sí tiene
-acceso real a los archivos del repo para diagnosticar y aplicar fixes.
+Corre en tu máquina, en la MISMA carpeta que sirve repo-victima.
 
 Uso:
     python agent_server.py
-    (en otra terminal) cloudflared tunnel run detective
-        — o, sin dominio propio: cloudflared tunnel --url http://localhost:5000
 
-Usá la URL https del túnel en el nodo HTTP Request de n8n que reemplaza
-a todo el bloque de RAG + agente + guardado. Ver README, sección
-"Exponer el servidor con Cloudflare Tunnel".
-
-Seguridad: el túnel es público. Toda request a /procesar tiene que traer
-el header X-Agent-Token igual a AGENT_TOKEN del .env, si no devuelve 401.
+En otra terminal:
+    cloudflared tunnel --url http://localhost:5000
 """
 
 import json
 import os
 import subprocess
-import sys
 from datetime import datetime, timedelta, timezone
-
+import threading
+import uuid
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from openai import OpenAI
 from supabase import create_client
 
+
 load_dotenv()
 
 app = Flask(__name__)
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-MODELO_AGENTE = os.getenv("AGENTE_MODELO", "opencode-go/deepseek-v4-flash")
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError(
+        "Falta OPENAI_API_KEY en el archivo .env"
+    )
+
+openai_client = OpenAI(
+    api_key=OPENAI_API_KEY
+)
+
+supabase = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
+)
+
+
+# Modelo que OpenCode utilizará.
+# Se toma directamente del .env.
+MODELO_AGENTE = os.getenv("AGENTE_MODELO")
+
+if not MODELO_AGENTE:
+    raise RuntimeError(
+        "Falta AGENTE_MODELO en el archivo .env"
+    )
+
+
+# Modelo OpenAI usado para generar el briefing.
 MODELO_SIMPLE = "gpt-4o-mini"
-CANTIDAD_CHUNKS_RAG = 3
-AGENT_TOKEN = os.getenv("AGENT_TOKEN")
-TIMEOUT_AGENTE_SEG = 240  # n8n espera 420 s en total; el resto es git + RAG + gpt-4o-mini
-# Si ya hay un incidente para el mismo endpoint más nuevo que esto, no se
-# vuelve a llamar al agente (el monitor de anomalías repite cada 5 min).
-VENTANA_DEDUP_HORAS = int(os.getenv("VENTANA_DEDUP_HORAS", "2"))
 
+CANTIDAD_CHUNKS_RAG = 3
+
+AGENT_TOKEN = os.getenv("AGENT_TOKEN")
+
+TIMEOUT_AGENTE_SEG = 600
+
+VENTANA_DEDUP_HORAS = int(
+    os.getenv("VENTANA_DEDUP_HORAS", "2")
+)
+
+
+# OpenCode instalado en Windows
+OPENCODE_CMD = r"C:\nvm4w\nodejs\opencode.CMD"
+
+
+# ============================================================
+# OPENAI — EMBEDDINGS
+# ============================================================
 
 def get_embedding(texto: str):
-    r = openai_client.embeddings.create(model="text-embedding-3-small", input=texto)
+
+    r = openai_client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texto
+    )
+
     return r.data[0].embedding
 
 
+# ============================================================
+# RAG
+# ============================================================
+
 def consultar_rag(descripcion_error: str):
+
     embedding = get_embedding(descripcion_error)
+
     contexto = supabase.rpc(
         "match_documents_bugs",
-        {"query_embedding": embedding, "match_count": CANTIDAD_CHUNKS_RAG, "filter": {}},
+        {
+            "query_embedding": embedding,
+            "match_count": CANTIDAD_CHUNKS_RAG,
+            "filter": {}
+        }
     ).execute()
+
     incidentes = supabase.rpc(
         "match_incidentes",
-        {"query_embedding": embedding, "match_count": CANTIDAD_CHUNKS_RAG, "filter": {}},
+        {
+            "query_embedding": embedding,
+            "match_count": CANTIDAD_CHUNKS_RAG,
+            "filter": {}
+        }
     ).execute()
-    return contexto.data or [], incidentes.data or []
+
+    return (
+        contexto.data or [],
+        incidentes.data or []
+    )
 
 
-def armar_prompt_final(payload, contexto_proyecto, incidentes_similares, repo_path):
-    contexto_texto = "\n\n".join(f"- {c['content']}" for c in contexto_proyecto) or "Sin contexto relevante."
-    incidentes_texto = "\n\n".join(f"- {i['content']}" for i in incidentes_similares) or "Sin incidentes previos."
+# ============================================================
+# CREAR PROMPT
+# ============================================================
 
-    briefing_input = f"""
-Sos un asistente que arma un briefing corto y claro para un agente de
-código. No diagnostiques vos mismo, solo organizá la información.
+def armar_prompt_final(
+    payload,
+    contexto_proyecto,
+    incidentes_similares,
+    repo_path
+):
+    descripcion = (
+        payload.get("descripcion")
+        or payload.get("stack_trace")
+        or payload.get("error")
+        or ""
+    )
 
-Error nuevo:
-- Endpoint: {payload.get('endpoint')}
-- Severidad: {payload.get('severity')}
-- Descripción/stack trace: {payload.get('descripcion')}
+    endpoint = payload.get("endpoint", "")
+    severity = payload.get("severity", "")
 
-Contexto del proyecto (RAG):
+    contexto_texto = "\n".join(
+        f"- {c['content']}"
+        for c in contexto_proyecto[:3]
+    ) or "Sin contexto adicional."
+
+    incidentes_texto = "\n".join(
+        f"- {i['content']}"
+        for i in incidentes_similares[:2]
+    ) or "Sin incidentes similares."
+
+    print("\n========== DATOS DEL ERROR ==========")
+    print(f"Endpoint: {endpoint}")
+    print(f"Severidad: {severity}")
+    print(f"Descripción:\n{descripcion}")
+    print("=====================================\n")
+
+    prompt_final = f"""
+Actuá como agente autónomo de código para "El Detective de Bugs".
+
+REPOSITORIO:
+{repo_path}
+
+BUG A SOLUCIONAR:
+Endpoint: {endpoint}
+Severidad: {severity}
+
+Error:
+{descripcion}
+
+CONTEXTO:
 {contexto_texto}
 
-Incidentes similares (RAG):
+INCIDENTES SIMILARES:
 {incidentes_texto}
 
-Armá el briefing en español, en un párrafo de no más de 120 palabras.
-""".strip()
+TAREA:
 
-    briefing = openai_client.chat.completions.create(
-        model=MODELO_SIMPLE,
-        messages=[{"role": "user", "content": briefing_input}],
-        temperature=0.2,
-    ).choices[0].message.content.strip()
+Solucioná ÚNICAMENTE el bug indicado en el error recibido.
 
-    return f"""
-Analizá este error y decidí qué hacer, siguiendo la regla de autonomía
-del proyecto: aplicá el fix directamente en todos los casos, pero si la
-lógica de negocio es ambigua, marcá confianza baja y explicá el riesgo
-en el resumen para el humano.
+1. Trabajá únicamente sobre el bug reportado.
+2. No busques ni arregles otros bugs.
+3. No revises README_BUGS.md para buscar tareas adicionales.
+4. Podés leer los archivos de código necesarios para encontrar la causa raíz.
+5. Aplicá directamente el cambio en el repositorio.
+6. No hagas refactorizaciones ni mejoras que no sean necesarias para solucionar este bug.
+7. Si el monitor reporta una anomalía, investigá su causa en el código y solucionála.
+8. No delegues el problema simplemente porque parezca una regla de negocio.
+9. Verificá que el cambio realizado solucione el bug recibido.
+10. Si encontrás otros errores durante la investigación, ignorálos.
+11. No modifiques dependencias ni archivos fuera del repositorio.
+12. El bug recibido es la única tarea.
+13. "accion_tomada" NUNCA puede ser "escalado" — esa opción no existe en
+    este proyecto. Si el bug involucra una regla de negocio ambigua
+    (como el Bug 3), igual aplicá el fix, y marcá "confianza": "baja"
+    explicando el riesgo en "resumen_para_humano". Nunca dejás un bug
+    sin tocar el código.
+14. Si el bug recibido es Bug 3, debés investigarlo y aplicar el
+    arreglo correspondiente en el código. No lo escales simplemente
+    porque involucre una regla de negocio — usá confianza baja en su
+    lugar.
 
-{briefing}
+15. Si te llega un bug de negocio que esos bugs los maneja el endpoind de anomalias deja el endpoint de anomalias SIN NINGUNA DETECCION, LIMPIALO.
+Usá comandos compatibles con Windows PowerShell.
 
-Repo en: {repo_path}
+Al terminar, respondé ÚNICAMENTE con JSON válido:
 
-Devolvé la respuesta ÚNICAMENTE en este formato JSON, sin texto extra:
 {{
-  "diagnostico": "texto explicando la causa raíz",
-  "accion_tomada": "fix_aplicado | solo_diagnostico | escalado",
-  "confianza": "alta | media | baja",
-  "archivo_modificado": "ruta o null",
-  "resumen_para_humano": "1-2 frases"
+  "diagnostico": "causa raíz del error",
+  "accion_tomada": "fix_aplicado o solo_diagnostico",
+  "confianza": "alta, media o baja",
+  "archivo_modificado": "ruta del archivo",
+  "resumen_para_humano": "qué cambiaste y por qué"
 }}
 """.strip()
 
+    print("\n========== PROMPT FINAL ==========")
+    print(prompt_final)
+    print("==================================\n")
 
-def git_pull(repo_path: str):
-    subprocess.run(["git", "-C", repo_path, "pull"], check=True, capture_output=True, text=True)
-
-
-def git_commit_y_push(repo_path: str, mensaje: str):
-    subprocess.run(["git", "-C", repo_path, "add", "-A"], check=True)
-    commit = subprocess.run(
-        ["git", "-C", repo_path, "commit", "-m", mensaje],
-        capture_output=True, text=True,
-    )
-    # Si el agente no tocó ningún archivo (solo_diagnostico/escalado),
-    # git commit falla con "nothing to commit" — no es un error real.
-    if commit.returncode != 0 and "nothing to commit" not in commit.stdout:
-        raise RuntimeError(f"git commit falló: {commit.stdout}\n{commit.stderr}")
-    if commit.returncode == 0:
-        subprocess.run(["git", "-C", repo_path, "push"], check=True, capture_output=True, text=True)
-
+    return prompt_final
+# ============================================================
+# EJECUTAR OPENCODE
+# ============================================================
 
 def llamar_agente(prompt_final: str, repo_path: str) -> dict:
-    """
-    Acá es donde el agente toca de verdad el repo víctima: corre en esta
-    misma máquina, con acceso real al sistema de archivos (un clone de
-    git de repo-victima, no el deploy de Render), así que puede leer el
-    código y aplicar el fix directamente.
-    """
-    try:
-        resultado = subprocess.run(
-            ["opencode", "run", "--agent", "detective-de-bugs", "--model", MODELO_AGENTE, "--format", "json", prompt_final],
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_AGENTE_SEG,
-            cwd=repo_path,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"El agente no terminó en {TIMEOUT_AGENTE_SEG} s; se abortó sin commitear.")
-    if resultado.returncode != 0:
-        raise RuntimeError(f"El agente falló: {resultado.stderr}")
-    return json.loads(resultado.stdout)
 
+    try:
+        entorno = os.environ.copy()
+        entorno["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+        resultado = subprocess.run(
+    [
+        OPENCODE_CMD,
+        "run",
+        "--agent",
+        "detective-de-bugs",
+        "--model",
+        MODELO_AGENTE,
+        "--format",
+        "json"
+        # OJO: el prompt YA NO va acá como argumento. Con shell=True en
+        # Windows, un texto largo y multilínea con comillas adentro (como
+        # el ejemplo de JSON que le pedimos al final del prompt) se
+        # rompe al pasar por DOS parseos de shell (cmd.exe + el .CMD de
+        # OpenCode), y el agente terminaba recibiendo solo un fragmento
+        # vacío — por eso respondía "no hay ningún error reportado".
+        # En vez de eso, se lo mandamos por stdin con "input=" de
+        # subprocess.run: OpenCode lee stdin hasta EOF antes de arrancar
+        # (está documentado así), y como no pasa por ningún parser de
+        # shell, no hay comillas que rompan nada.
+    ],
+    input=prompt_final,
+    capture_output=True,
+    text=True,
+    encoding="utf-8",
+    errors="replace",
+    timeout=TIMEOUT_AGENTE_SEG,
+    cwd=repo_path,
+    shell=True,
+    env=entorno
+)
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"El agente no terminó en "
+            f"{TIMEOUT_AGENTE_SEG} segundos."
+        )
+
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"No se encontró OpenCode en:\n"
+            f"{OPENCODE_CMD}\n\n"
+            f"Detalle: {e}"
+        )
+
+    print("\n========== OPENCODE ==========")
+    print("MODELO:", MODELO_AGENTE)
+    print("RETURN CODE:", resultado.returncode)
+
+    print("\n--- STDOUT ---")
+    print(resultado.stdout)
+
+    print("\n--- STDERR ---")
+    print(resultado.stderr)
+
+    print("========== FIN OPENCODE ==========\n")
+
+    if resultado.returncode != 0:
+        raise RuntimeError(
+            "OpenCode terminó con error.\n\n"
+            f"RETURN CODE: {resultado.returncode}\n\n"
+            f"STDOUT:\n{resultado.stdout}\n\n"
+            f"STDERR:\n{resultado.stderr}"
+        )
+
+    eventos = []
+
+    for linea in resultado.stdout.splitlines():
+        linea = linea.strip()
+
+        if not linea:
+            continue
+
+        try:
+            evento = json.loads(linea)
+            eventos.append(evento)
+
+        except json.JSONDecodeError:
+            continue
+
+    # ---------------------------------------------------------
+    # BUSCAR TEXTOS DEL AGENTE
+    # ---------------------------------------------------------
+
+    textos = []
+
+    for evento in eventos:
+
+        if evento.get("type") != "text":
+            continue
+
+        part = evento.get("part", {})
+        texto = part.get("text")
+
+        if texto:
+            textos.append(texto.strip())
+
+    # ---------------------------------------------------------
+    # SI HAY TEXTO, INTENTAMOS LEER EL JSON DEL AGENTE
+    # ---------------------------------------------------------
+
+    if textos:
+
+        respuesta_texto = textos[-1]
+
+        print("\n========== RESPUESTA DEL AGENTE ==========")
+        print(respuesta_texto)
+        print("==========================================\n")
+
+        try:
+            return json.loads(respuesta_texto)
+
+        except json.JSONDecodeError:
+
+            texto_limpio = respuesta_texto.strip()
+
+            if texto_limpio.startswith("```json"):
+                texto_limpio = texto_limpio[7:]
+
+            elif texto_limpio.startswith("```"):
+                texto_limpio = texto_limpio[3:]
+
+            if texto_limpio.endswith("```"):
+                texto_limpio = texto_limpio[:-3]
+
+            texto_limpio = texto_limpio.strip()
+
+            try:
+                return json.loads(texto_limpio)
+
+            except json.JSONDecodeError as e:
+
+                raise RuntimeError(
+                    "OpenCode terminó correctamente, "
+                    "pero el agente no devolvió el JSON esperado.\n\n"
+                    f"Error JSON: {e}\n\n"
+                    f"Respuesta del agente:\n{respuesta_texto}"
+                )
+
+    # ---------------------------------------------------------
+    # SI NO HAY TEXTO, ANALIZAMOS LOS EVENTOS
+    # ---------------------------------------------------------
+
+    herramientas = []
+
+    for evento in eventos:
+
+        if evento.get("type") != "tool_use":
+            continue
+
+        part = evento.get("part", {})
+
+        herramienta = part.get("tool")
+        call_id = part.get("callID")
+
+        state = part.get("state", {})
+
+        herramientas.append({
+            "tool": herramienta,
+            "call_id": call_id,
+            "status": state.get("status"),
+            "title": state.get("title"),
+            "error": state.get("error")
+        })
+
+    print("\n========== RESUMEN DE HERRAMIENTAS ==========")
+
+    for herramienta in herramientas:
+        print(herramienta)
+
+    print("==============================================\n")
+
+    if herramientas:
+
+        ultima = herramientas[-1]
+
+        raise RuntimeError(
+            "OpenCode terminó sin devolver una respuesta de texto.\n\n"
+            f"Última herramienta utilizada: {ultima.get('tool')}\n"
+            f"Estado: {ultima.get('status')}\n"
+            f"Título: {ultima.get('title')}\n"
+            f"Error: {ultima.get('error')}\n\n"
+            "Revisa la salida completa de OpenCode para determinar "
+            "por qué el agente no terminó su respuesta."
+        )
+
+    raise RuntimeError(
+        "OpenCode terminó correctamente, "
+        "pero no devolvió texto ni eventos de herramientas."
+    )
+# ============================================================
+# EVITAR INCIDENTES REPETIDOS
+# ============================================================
 
 def incidente_reciente(endpoint: str):
-    """Devuelve el incidente más nuevo del mismo endpoint dentro de la ventana, o None."""
+
     if not endpoint:
         return None
-    desde = (datetime.now(timezone.utc) - timedelta(hours=VENTANA_DEDUP_HORAS)).isoformat()
+
+    desde = (
+        datetime.now(timezone.utc)
+        - timedelta(hours=VENTANA_DEDUP_HORAS)
+    ).isoformat()
+
     r = (
         supabase.table("incidentes")
         .select("metadata")
-        .eq("metadata->>endpoint", endpoint)
-        .gte("metadata->>timestamp", desde)
-        .order("metadata->>timestamp", desc=True)
+        .eq(
+            "metadata->>endpoint",
+            endpoint
+        )
+        .gte(
+            "metadata->>timestamp",
+            desde
+        )
+        .order(
+            "metadata->>timestamp",
+            desc=True
+        )
         .limit(1)
         .execute()
     )
-    return r.data[0]["metadata"] if r.data else None
 
-
-def guardar_solucion(payload: dict, resultado_agente: dict):
-    texto = (
-        f"Error: {payload.get('descripcion')}\n"
-        f"Endpoint: {payload.get('endpoint')}\n"
-        f"Diagnóstico: {resultado_agente.get('diagnostico')}\n"
-        f"Acción tomada: {resultado_agente.get('accion_tomada')}\n"
-        f"Resumen: {resultado_agente.get('resumen_para_humano')}"
+    return (
+        r.data[0]["metadata"]
+        if r.data
+        else None
     )
+
+
+# ============================================================
+# GUARDAR SOLUCIÓN
+# ============================================================
+
+def guardar_solucion(
+    payload: dict,
+    resultado_agente: dict
+):
+
+    texto = (
+        f"Error: "
+        f"{payload.get('descripcion')}\n"
+
+        f"Endpoint: "
+        f"{payload.get('endpoint')}\n"
+
+        f"Diagnóstico: "
+        f"{resultado_agente.get('diagnostico')}\n"
+
+        f"Acción tomada: "
+        f"{resultado_agente.get('accion_tomada')}\n"
+
+        f"Resumen: "
+        f"{resultado_agente.get('resumen_para_humano')}"
+    )
+
     embedding = get_embedding(texto)
 
     supabase.table("incidentes").insert({
+
         "content": texto,
+
         "embedding": embedding,
+
         "metadata": {
-            "error_id": payload.get("error_id"),
-            "timestamp": payload.get("timestamp") or datetime.now(timezone.utc).isoformat(),
-            "endpoint": payload.get("endpoint"),
-            "severity": payload.get("severity"),
-            "origen": payload.get("origen"),
-            "diagnostico": resultado_agente.get("diagnostico"),
-            "accion_tomada": resultado_agente.get("accion_tomada"),
-            "confianza": resultado_agente.get("confianza"),
-            "archivo_modificado": resultado_agente.get("archivo_modificado"),
-            "resumen_para_humano": resultado_agente.get("resumen_para_humano"),
-            "estado": "resuelto" if resultado_agente.get("accion_tomada") == "fix_aplicado" else "pendiente",
-        },
+
+            "error_id":
+                payload.get("error_id"),
+
+            "timestamp":
+                payload.get("timestamp")
+                or datetime.now(
+                    timezone.utc
+                ).isoformat(),
+
+            "endpoint":
+                payload.get("endpoint"),
+
+            "severity":
+                payload.get("severity"),
+
+            "origen":
+                payload.get("origen"),
+
+            "diagnostico":
+                resultado_agente.get(
+                    "diagnostico"
+                ),
+
+            "accion_tomada":
+                resultado_agente.get(
+                    "accion_tomada"
+                ),
+
+            "confianza":
+                resultado_agente.get(
+                    "confianza"
+                ),
+
+            "archivo_modificado":
+                resultado_agente.get(
+                    "archivo_modificado"
+                ),
+
+            "resumen_para_humano":
+                resultado_agente.get(
+                    "resumen_para_humano"
+                ),
+
+            "estado":
+                (
+                    "resuelto"
+                    if resultado_agente.get(
+                        "accion_tomada"
+                    ) == "fix_aplicado"
+                    else "pendiente"
+                )
+        }
+
     }).execute()
 
+trabajos = {}
 
-@app.route("/procesar", methods=["POST"])
+def ejecutar_agente_en_segundo_plano(
+    payload,
+    contexto_proyecto,
+    incidentes_similares,
+    repo_path,
+    job_id
+):
+    try:
+        print(
+            f"[{job_id}] Iniciando agente...",
+            flush=True
+        )
+
+        prompt_final = armar_prompt_final(
+            payload,
+            contexto_proyecto,
+            incidentes_similares,
+            repo_path
+        )
+
+        print(
+            f"[{job_id}] Ejecutando OpenCode...",
+            flush=True
+        )
+
+        resultado_agente = llamar_agente(
+            prompt_final,
+            repo_path
+        )
+
+        print(
+            f"[{job_id}] OpenCode terminó.",
+            flush=True
+        )
+
+        guardar_solucion(
+            payload,
+            resultado_agente
+        )
+
+        print(
+            f"[{job_id}] Solución guardada.",
+            flush=True
+        )
+
+        trabajos[job_id] = {
+            "estado": "completado",
+            "resultado": resultado_agente
+        }
+
+    except Exception as e:
+
+        print(
+            f"[{job_id}] ERROR: {e}",
+            flush=True
+        )
+
+        trabajos[job_id] = {
+            "estado": "error",
+            "error": str(e)
+        }
+
+# ============================================================
+# ENDPOINT PRINCIPAL
+# ============================================================
+
+@app.route(
+    "/procesar",
+    methods=["POST"]
+)
 def procesar():
+
     if not AGENT_TOKEN:
-        return jsonify({"error": "AGENT_TOKEN no está definido en el .env del agente"}), 500
-    if request.headers.get("X-Agent-Token") != AGENT_TOKEN:
-        return jsonify({"error": "token inválido"}), 401
 
-    payload = request.get_json()
-    if not payload or "descripcion" not in payload:
-        return jsonify({"error": "falta 'descripcion' en el body"}), 400
-
-    repo_path = os.getenv("REPO_PATH")
-    if not repo_path or not os.path.isdir(repo_path):
         return jsonify({
-            "error": f"REPO_PATH mal configurado en el .env del agente: {repo_path!r}. "
-                     "Esto NO viene del payload — es la carpeta local donde vive el clone "
-                     "de repo-victima en ESTA máquina, la del agente."
+            "error":
+                "AGENT_TOKEN no está definido "
+                "en el .env del agente"
         }), 500
 
+
+    if request.headers.get(
+        "X-Agent-Token"
+    ) != AGENT_TOKEN:
+
+        return jsonify({
+            "error": "token inválido"
+        }), 401
+
+
+    payload = request.get_json()
+
+
+    if not payload:
+
+        return jsonify({
+            "error": "body inválido"
+        }), 400
+
+
+    descripcion = (
+        payload.get("descripcion")
+        or payload.get("stack_trace")
+        or payload.get("error")
+    )
+
+
+    if not descripcion:
+
+        return jsonify({
+            "error":
+                "falta 'descripcion' "
+                "o 'stack_trace' en el body"
+        }), 400
+
+
+    # Normalizamos el campo para el resto del sistema.
+    payload["descripcion"] = descripcion
+
+
+    repo_path = os.getenv(
+        "REPO_PATH"
+    )
+
+
+    if (
+        not repo_path
+        or not os.path.isdir(repo_path)
+    ):
+
+        return jsonify({
+
+            "error":
+                f"REPO_PATH mal configurado "
+                f"en el .env del agente: "
+                f"{repo_path!r}. "
+                f"Es la carpeta local de "
+                f"repo-victima en ESTA máquina."
+
+        }), 500
+
+
     try:
-        previo = incidente_reciente(payload.get("endpoint"))
+
+        previo = incidente_reciente(
+            payload.get("endpoint")
+        )
+
+
         if previo:
+
             return jsonify({
-                "skip": f"ya hay un incidente para {payload.get('endpoint')} en las últimas {VENTANA_DEDUP_HORAS} h",
-                "incidente_previo": previo,
+
+                "skip":
+                    f"ya hay un incidente para "
+                    f"{payload.get('endpoint')} "
+                    f"en las últimas "
+                    f"{VENTANA_DEDUP_HORAS} h",
+
+                "incidente_previo":
+                    previo
+
             }), 200
 
-        git_pull(repo_path)
-        contexto_proyecto, incidentes_similares = consultar_rag(payload["descripcion"])
-        prompt_final = armar_prompt_final(payload, contexto_proyecto, incidentes_similares, repo_path)
-        resultado_agente = llamar_agente(prompt_final, repo_path)
 
-        if resultado_agente.get("accion_tomada") == "fix_aplicado":
-            mensaje_commit = f"fix: {resultado_agente.get('diagnostico', 'fix automático del agente')[:72]}"
-            git_commit_y_push(repo_path, mensaje_commit)
+        print(
+            "Generando contexto RAG...",
+            flush=True
+        )
 
-        guardar_solucion(payload, resultado_agente)
-        return jsonify(resultado_agente), 200
+
+        contexto_proyecto, incidentes_similares = (
+            consultar_rag(
+                payload["descripcion"]
+            )
+        )
+
+
+        # ----------------------------------------
+        # CREAR ID DEL TRABAJO
+        # ----------------------------------------
+
+        job_id = str(
+            uuid.uuid4()
+        )
+
+
+        trabajos[job_id] = {
+            "estado": "procesando"
+        }
+
+
+        # ----------------------------------------
+        # LANZAR AGENTE EN SEGUNDO PLANO
+        # ----------------------------------------
+
+        hilo = threading.Thread(
+            target=ejecutar_agente_en_segundo_plano,
+            args=(
+                payload,
+                contexto_proyecto,
+                incidentes_similares,
+                repo_path,
+                job_id
+            ),
+            daemon=True
+        )
+
+        hilo.start()
+
+
+        # ----------------------------------------
+        # RESPONDER INMEDIATAMENTE
+        # ----------------------------------------
+
+        return jsonify({
+
+            "estado": "procesando",
+
+            "job_id": job_id,
+
+            "mensaje":
+                "El error fue recibido. "
+                "El agente está investigando "
+                "el repositorio."
+
+        }), 202
+
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 
-@app.route("/salud", methods=["GET"])
+@app.route(
+    "/trabajos/<job_id>",
+    methods=["GET"]
+)
+def ver_trabajo(job_id):
+    trabajo = trabajos.get(job_id)
+    if not trabajo:
+        return jsonify({"error": "job_id no encontrado"}), 404
+    return jsonify(trabajo)
+
+
+# ============================================================
+# SALUD
+# ============================================================
+
+@app.route(
+    "/salud",
+    methods=["GET"]
+)
 def salud():
-    return jsonify({"ok": True, "servicio": "agente-detective-local"})
 
+    return jsonify({
+        "ok": True,
+        "servicio":
+            "agente-detective-local"
+    })
+
+
+# ============================================================
+# INICIO
+# ============================================================
 
 if __name__ == "__main__":
-    print("Servidor del agente local corriendo en http://localhost:5000")
-    print("Exponelo con: cloudflared tunnel run detective  (o: cloudflared tunnel --url http://localhost:5000)")
-    app.run(host="0.0.0.0", port=5000)
+
+    print(
+        "Servidor del agente local "
+        "corriendo en "
+        "http://localhost:5000"
+    )
+
+    print(
+        "Exponelo con: "
+        "cloudflared tunnel "
+        "--url http://localhost:5000"
+    )
+
+    print(
+        f"Modelo del agente: "
+        f"{MODELO_AGENTE}"
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=5000
+    )

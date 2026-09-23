@@ -229,8 +229,26 @@ def llamar_agente(prompt_final: str, job_id: str) -> dict:
     if resultado.returncode != 0:
         raise RuntimeError(f"OpenCode terminó con error.\nSTDOUT:\n{resultado.stdout}\nSTDERR:\n{resultado.stderr}")
 
+    # Intentamos extraer el JSON de la respuesta, pero un fallo acá
+    # NUNCA debe impedir que se pusheen los cambios ya aplicados.
+    try:
+        return _parsear_respuesta_agente(resultado.stdout)
+    except RuntimeError as e:
+        print(f"[{job_id}] No se pudo parsear el JSON del agente: {e}", flush=True)
+        # Devolvemos un resultado "genérico" en vez de explotar,
+        # para que el caller decida el push según el estado real del repo.
+        return {
+            "diagnostico": "No se pudo extraer diagnóstico (el agente no devolvió JSON válido).",
+            "accion_tomada": "desconocido",
+            "confianza": "baja",
+            "archivo_modificado": None,
+            "resumen_para_humano": "El agente aplicó cambios pero no devolvió un JSON parseable. Ver logs.",
+        }
+
+
+def _parsear_respuesta_agente(stdout: str) -> dict:
     eventos = []
-    for linea in resultado.stdout.splitlines():
+    for linea in stdout.splitlines():
         linea = linea.strip()
         if not linea:
             continue
@@ -248,10 +266,7 @@ def llamar_agente(prompt_final: str, job_id: str) -> dict:
             textos.append(texto.strip())
 
     if not textos:
-        raise RuntimeError(
-            "OpenCode terminó correctamente, pero no devolvió texto.\n"
-            f"Salida completa:\n{resultado.stdout}"
-        )
+        raise RuntimeError(f"OpenCode no devolvió texto.\nSalida completa:\n{stdout}")
 
     respuesta_texto = textos[-1]
 
@@ -322,6 +337,14 @@ def guardar_solucion(payload: dict, resultado_agente: dict):
 trabajos = {}
 
 
+def hay_cambios_sin_commitear() -> bool:
+    resultado = subprocess.run(
+        ["git", "-C", REPO_PATH, "status", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    return bool(resultado.stdout.strip())
+
+
 def ejecutar_agente_en_segundo_plano(payload, contexto_proyecto, incidentes_similares, job_id):
     try:
         print(f"[{job_id}] git clone/pull...", flush=True)
@@ -334,10 +357,18 @@ def ejecutar_agente_en_segundo_plano(payload, contexto_proyecto, incidentes_simi
 
         resultado_agente = llamar_agente(prompt_final, job_id)
 
-        if resultado_agente.get("accion_tomada") == "fix_aplicado":
-            print(f"[{job_id}] git commit + push...", flush=True)
+        # Pusheamos según el ESTADO REAL DEL REPO, no según lo que diga
+        # el JSON (que puede venir mal parseado igual habiendo cambios).
+        if hay_cambios_sin_commitear():
+            print(f"[{job_id}] Hay cambios en el repo → git commit + push...", flush=True)
             mensaje = f"fix: {resultado_agente.get('diagnostico', 'fix automático del agente')[:72]}"
             git_commit_y_push(mensaje)
+            # Si el JSON no traía accion_tomada clara pero SÍ hubo cambios reales,
+            # lo marcamos como fix_aplicado para que quede bien registrado.
+            if resultado_agente.get("accion_tomada") not in ("fix_aplicado", "solo_diagnostico"):
+                resultado_agente["accion_tomada"] = "fix_aplicado"
+        else:
+            print(f"[{job_id}] Sin cambios en el repo, no se pushea.", flush=True)
 
         guardar_solucion(payload, resultado_agente)
         print(f"[{job_id}] Listo.", flush=True)
@@ -346,7 +377,6 @@ def ejecutar_agente_en_segundo_plano(payload, contexto_proyecto, incidentes_simi
     except Exception as e:
         print(f"[{job_id}] ERROR: {e}", flush=True)
         trabajos[job_id] = {"estado": "error", "error": str(e)}
-
 
 # ============================================================
 # ENDPOINTS

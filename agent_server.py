@@ -329,8 +329,9 @@ def ejecutar_agente_en_segundo_plano(payload, contexto_proyecto, incidentes_simi
 
         print(f"[{job_id}] Armando prompt...", flush=True)
         prompt_final = armar_prompt_final(payload, contexto_proyecto, incidentes_similares)
-
+        print(f"[{job_id}] PROMPT COMPLETO:\n{prompt_final}", flush=True)
         print(f"[{job_id}] Ejecutando OpenCode...", flush=True)
+
         resultado_agente = llamar_agente(prompt_final, job_id)
 
         if resultado_agente.get("accion_tomada") == "fix_aplicado":

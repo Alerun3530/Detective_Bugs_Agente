@@ -199,8 +199,11 @@ Al terminar, respondé ÚNICAMENTE con JSON válido:
 # EJECUTAR OPENCODE
 # ============================================================
 
-def llamar_agente(prompt_final: str) -> dict:
+def llamar_agente(prompt_final: str, job_id: str) -> dict:
     entorno = os.environ.copy()
+    home_aislado = f"/tmp/opencode-home-{job_id}"
+    os.makedirs(home_aislado, exist_ok=True)
+    entorno["HOME"] = home_aislado
 
     try:
         resultado = subprocess.run(
@@ -213,10 +216,6 @@ def llamar_agente(prompt_final: str) -> dict:
             timeout=TIMEOUT_AGENTE_SEG,
             cwd=REPO_PATH,
             env=entorno,
-            # Sin shell=True: en Linux, subprocess con una lista de
-            # argumentos ejecuta el proceso directo (execve), sin pasar
-            # por ningún shell que reinterprete comillas. El prompt va
-            # por stdin igual, por las dudas de tamaño/caracteres raros.
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"El agente no terminó en {TIMEOUT_AGENTE_SEG} segundos.")
@@ -332,7 +331,7 @@ def ejecutar_agente_en_segundo_plano(payload, contexto_proyecto, incidentes_simi
         prompt_final = armar_prompt_final(payload, contexto_proyecto, incidentes_similares)
 
         print(f"[{job_id}] Ejecutando OpenCode...", flush=True)
-        resultado_agente = llamar_agente(prompt_final)
+        resultado_agente = llamar_agente(prompt_final, job_id)
 
         if resultado_agente.get("accion_tomada") == "fix_aplicado":
             print(f"[{job_id}] git commit + push...", flush=True)
